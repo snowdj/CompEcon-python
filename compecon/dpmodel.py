@@ -3,6 +3,7 @@ import time
 from compecon.tools import Options_Container, qzordered
 from compecon.nonlinear import MCP
 from compecon.lcpstep import lcpstep
+from compecon.lqmodel import LQmodel
 import numpy as np
 import scipy as sp
 import pandas as pd
@@ -378,17 +379,6 @@ class DPmodel(object):
 
         return (f, fx, fxx) if derivative else f
 
-        #  ======OLD VERSION BELOW THIS LINE=======
-        # if self.options.D_reward_provided:
-        #     f, fx, fxx = self.__f(s, x, i, j)
-        #     if self.options.discretized:
-        #         return f.reshape(1, ns)
-        #     else:
-        #         return f.reshape(1, ns), fx.reshape(dx, ns), fxx.reshape(dx, dx, ns)
-        # elif self.options.discretized:
-        #     return self.__f(s, x, i, j).reshape(1, ns)
-        # else:
-        #     return self.getDerivative('reward', s, x, i, j)
 
     def transition(self, s, x, i, j, in_, e, derivative=False):  # --> (g, gx, gxx)
         """ Returns the next-period continuous state and its first- and second-derivatives.
@@ -407,17 +397,6 @@ class DPmodel(object):
 
         return (g, gx, gxx) if derivative else g
 
-        #  ======OLD VERSION BELOW THIS LINE=======
-        # if dx > 0 and self.options.D_transition_provided:
-        #     g, gx, gxx = self.__g(s, x, i, j, in_, e)
-        #     if self.options.discretized or not derivative:
-        #         return g.reshape(ds, ns)
-        #     else:
-        #         return g.reshape(ds, ns), gx.reshape(dx, ds, ns), gxx.reshape(dx, dx, ds, ns)
-        # elif self.options.discretized:
-        #     return self.__g(s, x, i, j, in_, e).reshape(ds, ns)
-        # else:
-        #     return self.getDerivative('transition', s, x, i, j, in_, e)
 
     def solve(self, v=None, x=None, nr=10, **kwargs):
         """ Solves the model
@@ -475,17 +454,22 @@ class DPmodel(object):
 
         self.update_policy()
 
-        if nr:
-            return self.residuals(nr)
+        if nr is not None:
+            return self.solution(nr)
 
-    def residuals(self, nr=10):
+    def solution(self, nr=10, resid=True):
         """
-        Computes residuals over a refined grid
+        Computes solution over a refined grid
 
-        If nr is scalar, compute a grid. Otherwise compute residuals over provided nr (sr)
+        nr:  scalar or np.array
+            -- scalar >> compute a grid from basis
+            -- array  >> compute solution over provided values
+        resid: compute residuals if True
 
         """
         # TODO:  Make finite horizon case
+
+        ni, nj, ds, dx = self.dims['ni', 'nj','ds', 'dx']
 
 
         scalar_input = np.isscalar(nr) and isinstance(nr, int)
@@ -499,79 +483,59 @@ class DPmodel(object):
             sr = np.atleast_2d(nr)
             assert sr.shape[0] == self.dims.ds, 'provided s grid must have {} rows'.format(self.dims.ds)
 
+        ''' MAKE DATABASE'''
+        # ADD CONTINUOUS STATE VARIABLE
+        DATA = pd.DataFrame(np.tile(sr, ni).T, columns=self.labels.s)
+
+        # ADD DISCRETE STATE VARIABLE
+        if ni > 1:
+            ivals= np.repeat(np.arange(ni), sr.shape[1])
+            icat = pd.Categorical.from_codes(ivals, self.labels.i)
+            DATA['i'] = ivals
+
+        # SET INDEX FOR DATA
+        if ds == 1:
+            slab = DATA[self.labels.s[0]]
+            if ni > 1:
+                DATA.index = pd.MultiIndex.from_arrays([icat, slab])
+            else:
+                DATA.index = slab
+        elif ni > 1:
+            DATA.index = icat
+
+        # COMPUTE OPTIMAL POLICY AND VALUE
         xr = self.Policy_j(sr, dropdim=False)  # [0] because there is only 1 order
         vr = self.vmax(sr, xr, self.Value)
-        vopt = np.max(vr, -2)
-        resid = self.Value(sr, dropdim=False) - vopt
+        v_LHS = self.Value(sr, dropdim=False) # LHS of Bellman equation: V(s)
 
-        ni, nj, dx = self.dims['ni', 'nj', 'dx']
+        # ADD VALUE FUNCTION
+        DATA['value'] = v_LHS.flatten()
 
-        discrete_indices = np.indices(vr.shape)[:2].reshape(2, -1)
-        data = np.vstack((
-            discrete_indices,
-            np.tile(sr, ni * nj),
-            vr.flatten()
-        ))
+        # ADD RESIDUAL IF REQUESTED
+        if resid:
+            v_RHS = np.max(vr, -2)  # RHS of Bellman equation: max[f(s,x) + dV(s')]
+            DATA['resid'] = (v_LHS - v_RHS).flatten()
 
-        columns = ["i", "j"] + self.labels.s + ['value_j' if nj > 1 else 'value']
+        # ADD VALUE FUNCTION PER DISCRETE ACTION
+        if nj > 1:
+            tempj = np.argmax(vr,-2).flatten()
+            DATA['j*'] = pd.Categorical.from_codes(tempj,self.labels.j)  # optimal discrete choice
 
-        # Add continuous action
+            for j, jlabel in enumerate(self.labels.j):
+                DATA['value[' + jlabel + ']'] = vr[:, j].flatten()
+
+        # ADD CONTINUOUS ACTION
         if dx:
-            xr = np.rollaxis(xr, -2)
-            xr.shape = (dx, -1)
-            data = np.vstack((data, xr))
-            columns = columns + list(self.labels.x)
-        data = pd.DataFrame(data.T, columns=columns)
+            for ix, xlabel in enumerate(self.labels.x):
+                DATA[xlabel] = self.Policy(sr, dropdim=False)[:,ix].flatten()
 
-        # Add residuals
-        data['resid'] = np.nan
-        data.resid[data.j == 0] = resid.flatten()
-
-        # Add value
-        if nj > 1:
-            data['value'] = np.nan
-            data.value[data.j == 0] = vopt.flatten()
-
-        # eliminate singleton dimensions, label non-singleton dimensions
-        if ni > 1:
-            data['i'] = self.__as_categorical(data.i, True)
-        else:
-            del data['i']
-
-        if nj > 1:
-            data['j'] = self.__as_categorical(data.j, False)
-        else:
-            del data['j']
-
-        return data
-
-        '''
-        # eliminate singleton dimensions and return
-        if scalar_input:
-            if self.dims.dx:
-                return np.squeeze(resid), sr, np.squeeze(vr), np.squeeze(xr)
-            else:
-                return np.squeeze(resid), sr, np.squeeze(vr)
-        else:
-            return np.squeeze(resid)
-
-        '''
-
-    def __as_categorical(self, vals, ii=True):
-        """
-        Converts vector of integers (representing states or actions) to a pandas categorical variable.
-        Args:
-            vals: vector of integers, representing discrete states or actions
-            ii: Use discrete states if True, else use discrete actions
-
-        Returns:
-            A pandas categorical series.
-
-        """
-        labels = np.array(self.labels.i if ii else self.labels.j)
-        return pd.Categorical(labels[vals], labels)
+                # ADD CONTINUOUS ACTION PER DISCRETE ACTION
+                if nj > 1:
+                    for j, jlabel in enumerate(self.labels.j):
+                        DATA[xlabel + '[' + jlabel + ']'] = xr[:, j, ix].flatten()
 
 
+        return DATA
 
 
     def simulate(self, nper, sinit, iinit=0, seed=None):
@@ -667,7 +631,7 @@ class DPmodel(object):
                 ee = np.tile(self.random.e, nrep)     #self.random.e[ones(nrep,1),:]  #fixme make sure dimensions are ok
             else:
                 ee = self.random.e[:, np.random.choice(ne, nrep, p=self.random.w)] #fixme make sure dimensions are ok
-                # ee = self.random.e[:, discrand(nrep,self.random.w)] #fixme make sure dimensions are ok
+
 
 
             ### Compute the new state: use the Markov transition matrix self.random.q to update
@@ -709,31 +673,40 @@ class DPmodel(object):
         tsim, rsim = gridmake(np.arange(nper), np.arange(nrep))
 
         ### Make the table.
+        DATA = pd.DataFrame()
+        DATA['time'] = tsim
+        if nrep > 1:
+            DATA['_rep'] = rsim
 
-        data = list()
-        data.append(pd.Series(tsim, name='time'))
         if ni > 1:
-            idata = [self.labels.i[k] for k in isim.flatten()]  # todo this looks ugly, find other way to put labels to category
-            if isinstance(self.labels.i[0], str):
-                data.append(pd.Series(idata, name='i', dtype="category"))
-            else:
-                data.append(pd.Series(idata, name='i'))
+            DATA['i'] = pd.Categorical.from_codes(isim.flatten(),self.labels.i)
 
-        data.append(pd.DataFrame(ssim.swapaxes(0, 1).reshape((ds, -1)).T, columns=self.labels.s))
+        sdata = ssim.swapaxes(0, 1).reshape((ds, -1))
+        for k, slab in enumerate(self.labels.s):
+            DATA[slab] = sdata[k]
 
         if nj > 1:
-            jdata = [self.labels.j[k] for k in jsim.flatten()]  # todo this looks ugly, find other way to put labels to category
-            data.append(pd.Series(jdata, name='j', dtype="category"))
+            DATA['j*'] = pd.Categorical.from_codes(jsim.flatten(), self.labels.j)
 
         if dx > 0:
-            data.append(pd.DataFrame(xsim.swapaxes(0, 1).reshape((dx, -1)).T, columns=self.labels.x))
+            xdata = xsim.swapaxes(0, 1).reshape((dx, -1))
+            for k, xlab in enumerate(self.labels.x):
+                DATA[xlab] = xdata[k]
 
-        if nrep > 1:
-            data.append(pd.Series(rsim, name='_rep'))
+        return DATA
 
-        return pd.concat(data, axis=1,copy=False)
 
-    def lqapprox(self, s0, x0, steady=False):
+    def lqapprox(self, s0, x0):
+        """
+        Solves discrete time continuous state/action dynamic programming model using a linear quadratic approximation
+        Args:
+            s0: steady-state state
+            x0:  steady-state action
+
+        Returns:
+            A LQmodel object
+        """
+
 
         assert (self.dims.ni * self.dims.nj < 2), 'Linear-Quadratic not implemented for models with discrete state or choice'
         s0, x0 = np.atleast_1d(s0, x0)
@@ -781,96 +754,7 @@ class DPmodel(object):
         fx += - s0.T @ fsx - x0.T @ fxx
         g0 += - gs @ s0 - gx @ x0
 
-        # Solve Riccati equation using QZ decomposition
-        dx2ds = dx + 2 * ds
-        A = np.zeros((dx2ds, dx2ds))
-        A[:ds, :ds] = np.identity(ds)
-        A[ds:-ds, -ds:] = -delta * gx.T
-        A[-ds:, -ds:] = delta * gs.T
-
-        B = np.zeros_like(A)
-        B[:ds, :-ds] = np.c_[gs, gx]
-        B[ds: -ds, :-ds] = np.c_[fsx.T, fxx]
-        B[-ds:] = np.c_[-fss, -fsx, np.identity(ds)]
-
-        S, T, Q, Z = qzordered(A, B)
-        C = np.real(np.linalg.solve(Z[:ds, :ds].T, Z[ds:, :ds].T)).T
-        X = C[:dx]
-        P = C[dx:, :]
-
-        # Compute steady-state state, action, and shadow price
-        t0 = np.r_[np.c_[fsx.T, fxx, delta * gx.T],
-                  np.c_[fss, fsx, delta*gs.T - np.eye(ds)],
-                  np.c_[gs - np.eye(ds), gx, np.zeros((ds, ds))]]
-        t1 = np.r_[-fx.T, -fs.T, -g0]
-        t = np.linalg.solve(t0, t1)
-        sstar, xstar, pstar = np.split(t, [ds, ds + dx])
-        vstar = (f0 + fs @ sstar + fx @ xstar + 0.5 * sstar.T @ fss @ sstar +
-                 sstar.T @ fsx @ xstar + 0.5 * xstar.T @ fxx @ xstar) / (1 - delta)
-
-        # Compute lq-approximation optimal policy and shadow price functions at state nodes
-        s = self.Value.nodes.T.copy()
-        sstar = sstar.T
-        xstar = xstar.T
-        pstar = pstar.T
-        s -= sstar   # hopefully broadcasting works here  (np.ones(ns,1),:)  #todo make sure!!
-        xlq = xstar + s @ X.T  #(np.ones(1,ns),:)
-        plq = pstar + s @ P.T   #(np.ones(1,ns),:)
-        vlq = vstar + s @ pstar.T + 0.5 * np.sum(s * (s @ P.T), axis=1,keepdims=True)
-
-        self.Value[:] = vlq.T[:]
-        self.Value_j[:]= vlq.T[:]
-        self.Policy[:] = xlq.T[:]
-        self.Policy_j[:] = xlq.T[:]
-
-
-        #MAKE PANDAS DATAFRAME
-        ni, nj, dx = self.dims['ni', 'nj', 'dx']
-
-        sr = self.Value.nodes.copy()
-        discrete_indices = np.indices(vlq.shape)[:2].reshape(2, -1)
-        data = np.vstack((
-            discrete_indices,
-            np.tile(sr, ni * nj),
-            vlq.T.flatten()
-        ))
-
-        columns = ["i", "j"] + self.labels.s + ['value_j' if nj > 1 else 'value']
-
-        # Add continuous action
-        if dx:
-            xlq = np.rollaxis(xlq, -2)
-            xlq.shape = (dx, -1)
-            data = np.vstack((data, xlq))
-            columns = columns + list(self.labels.x)
-
-        data = pd.DataFrame(data.T, columns=columns)
-
-        # Add value
-        if nj > 1:
-            data['value'] = np.nan
-            data.value[data.j == 0] = vlq.flatten()
-
-        # eliminate singleton dimensions, label non-singleton dimensions
-        if ni > 1:
-            data['i'] = self.__as_categorical(data.i, True)
-        else:
-            del data['i']
-
-        if nj > 1:
-            data['j'] = self.__as_categorical(data.j, False)
-        else:
-            del data['j']
-
-        if steady:
-            ss0 = {a: b for a, b in zip(self.labels.s, sstar)}
-            ss0.update({a: b for a, b in zip(self.labels.x, xstar)})
-            ss0['value'] = vstar
-            ss0['shadow'] = pstar
-
-        return (data, ss0) if steady else data
-
-
+        return LQmodel(f0, fs, fx, fss, fsx, fxx, g0, gs, gx, delta,self.labels.s, self.labels.x)
 
 
     def __solve_backwards(self):

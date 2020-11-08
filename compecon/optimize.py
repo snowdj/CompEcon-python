@@ -27,7 +27,7 @@ class OPoptions(Options_Container):
     description = 'Options for solving a Unconstraint Optimization Problem'
 
     def __init__(self, SearchMeth='bfgs', StepMeth='bt', maxit=250, maxsteps=50, tol=SQEPS,
-                 print=False, eps0=1.0, eps1=1.e-12,all_x=False):
+                 show=False, eps0=1.0, eps1=1.e-12,all_x=False, print=None):
         self.SearchMeth = SearchMeth
         self.StepMeth = StepMeth
         self.maxit = maxit
@@ -35,17 +35,20 @@ class OPoptions(Options_Container):
         self.tol = tol
         self.eps0 = eps0
         self.eps1 = eps1
-        self.print = print
+        self.show = show
         self.all_x = all_x
+        if print is not None:
+            warnings.warn("Keyword 'print=' is deprecated. Use 'show=' instead")
+            self.show = print
 
     def print_header(self):
-        if self.print:
+        if self.show:
             print("Solving nonlinear equations by {}'s method".format(self.SearchMeth.capitalize()))
             print('{:4}  {:4}  {:6}'.format('it', 'bstep', 'change'))
             print('-' * 20)
 
     def print_current_iteration(self, it, backstep, fnormnew):
-        if self.print:
+        if self.show:
             print('{:4}  {:4}  {:6.2e}'.format(it, backstep, fnormnew))
 
     def print_last_iteration(self, it):
@@ -125,29 +128,27 @@ class OP(Options_Container):
         # Update solution options using kwargs
         self.opts[kwargs.keys()] = kwargs.values()
         self.opts.method = 'golden'
-        alpha1 = (3 - np.sqrt(5)) / 2
-        alpha2 = (np.sqrt(5) - 1) / 2
+        φ = (np.sqrt(5) - 1) / 2  # golden ratio
 
         if a > b:
             a, b = b, a
 
-        d = b - a
-        x1 = a + alpha1 * d
-        x2 = a + alpha2 * d
+        Δ = (b - a) * (1 - φ)
+        x = a + Δ
+        y = b - Δ
+        fx, fy = self.f(x), self.f(y)
 
-        f1, f2 = self.f(x1), self.f(x2)
+        Δ *= φ
+        while Δ > self.opts.tol:
+            Δ *= φ
+            if fy < fx: # y is new upper bound
+                x, y = x - Δ, x
+                fx, fy = self.f(x), fx
+            else:  # x is new lower bound
+                x, y = y, y + Δ
+                fx, fy = fy, self.f(y)
 
-        d *= (alpha1 * alpha2)
-        while d > self.opts.tol:
-            d *= alpha2
-            if f2 < f1: # x2 is new upper bound
-                x2, x1 = x1, x1 - d
-                f2, f1 = f1, self.f(x1)
-            else:  # x1 is new lower bound
-                x1, x2 = x2, x2 + d
-                f1, f2 = f2, self.f(x2)
-
-        return x1 if f1 > f2 else x2
+        return x if fx > fy else y
 
     def qnewton(self, x0=None, A=None, **kwargs):
 
